@@ -3,21 +3,23 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
-# For inquiries contact  george.drettakis@inria.fr
+# For inquiries contact george.drettakis@inria.fr
 #
 
 from argparse import ArgumentParser, Namespace
 import sys
 import os
 
+
 class GroupParams:
     pass
 
+
 class ParamGroup:
-    def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
+    def __init__(self, parser: ArgumentParser, name: str, fill_none=False):
         group = parser.add_argument_group(name)
         for key, value in vars(self).items():
             shorthand = False
@@ -25,7 +27,7 @@ class ParamGroup:
                 shorthand = True
                 key = key[1:]
             t = type(value)
-            value = value if not fill_none else None 
+            value = value if not fill_none else None
             if shorthand:
                 if t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
@@ -44,7 +46,8 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
@@ -61,12 +64,14 @@ class ModelParams(ParamGroup):
         g.source_path = os.path.abspath(g.source_path)
         return g
 
+
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
+
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
@@ -88,9 +93,26 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.depth_threshold = 0.37
         self.random_background = False
+
+        # Boundary-guided progressive Gaussian propagation.
+        # Does not modify CUDA rasterizer/kernel. It only adds Python-side
+        # statistics and relaxes densification for large, boundary-truncated,
+        # high-error Gaussians.
+        self.enable_boundary_propagation = False
+        self.boundary_start_iter = 1500
+        self.boundary_band_ratio = 0.12
+        self.boundary_min_truncation = 0.25
+        self.boundary_error_threshold = 1.10
+        self.boundary_score_threshold = 0.20
+        self.boundary_grad_relax = 0.35
+        self.boundary_boost_lambda = 1.25
+        self.boundary_boost_max = 3.0
+        self.boundary_split_shrink = 1.0
+
         super().__init__(parser, "Optimization Parameters")
 
-def get_combined_args(parser : ArgumentParser):
+
+def get_combined_args(parser: ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
@@ -104,10 +126,11 @@ def get_combined_args(parser : ArgumentParser):
     except TypeError:
         print("Config file not found at")
         pass
+
     args_cfgfile = eval(cfgfile_string)
 
     merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
+    for k, v in vars(args_cmdline).items():
+        if v is not None:
             merged_dict[k] = v
     return Namespace(**merged_dict)
