@@ -94,20 +94,33 @@ class OptimizationParams(ParamGroup):
         self.depth_threshold = 0.37
         self.random_background = False
 
-        # Boundary-guided progressive Gaussian propagation.
-        # Does not modify CUDA rasterizer/kernel. It only adds Python-side
-        # statistics and relaxes densification for large, boundary-truncated,
-        # high-error Gaussians.
+        # Boundary-guided progressive densification.
+        # The revised defaults keep the LPIPS-oriented local-detail gain while
+        # reducing false-positive splitting and photometric drift.
         self.enable_boundary_propagation = False
         self.boundary_start_iter = 1500
-        self.boundary_band_ratio = 0.12
-        self.boundary_min_truncation = 0.25
+
+        # Stage 1: image-level boundary gate (cheap pre-filter).
+        self.boundary_band_ratio = 0.08
         self.boundary_error_threshold = 1.10
+
+        # Stage 2: Gaussian-local residual gate.
+        self.boundary_local_window = 9
+        self.boundary_local_error_threshold = 1.10
+        self.boundary_local_error_cap = 1.80
+        self.boundary_min_observations = 2
+        # Backward-compatible alias used by some train.py variants.
+        # Both names describe the same minimum number of supporting views.
+        self.boundary_min_view_count = 2
+
+        # Geometric and densification controls.
+        self.boundary_min_truncation = 0.30
         self.boundary_score_threshold = 0.20
-        self.boundary_grad_relax = 0.35
-        self.boundary_boost_lambda = 1.25
-        self.boundary_boost_max = 3.0
-        self.boundary_split_shrink = 1.0
+        self.boundary_grad_relax = 0.60
+        self.boundary_boost_lambda = 1.00
+        self.boundary_boost_max = 2.00
+        self.boundary_split_shrink = 1.05
+        self.boundary_child_opacity_budget = 0.20
 
         super().__init__(parser, "Optimization Parameters")
 
@@ -128,7 +141,6 @@ def get_combined_args(parser: ArgumentParser):
         pass
 
     args_cfgfile = eval(cfgfile_string)
-
     merged_dict = vars(args_cfgfile).copy()
     for k, v in vars(args_cmdline).items():
         if v is not None:

@@ -11,10 +11,10 @@
 
 import os
 import torch
+import torch.nn.functional as F
 import numpy as np
 from torch import nn
 from plyfile import PlyData, PlyElement
-
 from simple_knn._C import distCUDA2
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from utils.general_utils import strip_symmetric, build_scaling_rotation
@@ -51,10 +51,13 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
 
-        # Extra Python-side statistics for boundary-guided progressive densification.
-        # They are reset after densification, just like xyz_gradient_accum/denom.
+        # Python-side statistics for boundary-guided densification.
         self.boundary_score_accum = torch.empty(0)
         self.boundary_denom = torch.empty(0)
+
+        # Backward-compatible defaults; overwritten in training_setup().
+        self.boundary_min_observations = 2
+        self.boundary_child_opacity_budget = 0.20
 
         self.optimizer = None
         self.percent_dense = 0
@@ -130,22 +133,33 @@ class GaussianModel:
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features = torch.zeros(
+            (fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)
+        ).float().cuda()
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(
+            distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
+            0.0000001,
+        )
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(
+            0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+        )
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(
+            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        self._features_rest = nn.Parameter(
+            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+        )
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
@@ -153,15 +167,40 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.boundary_min_observations = max(
+            1,
+            int(
+                getattr(
+                    training_args,
+                    "boundary_min_observations",
+                    getattr(training_args, "boundary_min_view_count", 2),
+                )
+            ),
+        )
+        self.boundary_child_opacity_budget = float(
+            getattr(training_args, "boundary_child_opacity_budget", 0.20)
+        )
+        self.boundary_child_opacity_budget = min(
+            max(self.boundary_child_opacity_budget, 0.0), 1.0
+        )
+
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.boundary_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.boundary_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
-            {"params": [self._xyz], "lr": training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {
+                "params": [self._xyz],
+                "lr": training_args.position_lr_init * self.spatial_lr_scale,
+                "name": "xyz",
+            },
             {"params": [self._features_dc], "lr": training_args.feature_lr, "name": "f_dc"},
-            {"params": [self._features_rest], "lr": training_args.feature_lr / 20.0, "name": "f_rest"},
+            {
+                "params": [self._features_rest],
+                "lr": training_args.feature_lr / 20.0,
+                "name": "f_rest",
+            },
             {"params": [self._opacity], "lr": training_args.opacity_lr, "name": "opacity"},
             {"params": [self._scaling], "lr": training_args.scaling_lr, "name": "scaling"},
             {"params": [self._rotation], "lr": training_args.rotation_lr, "name": "rotation"},
@@ -182,10 +221,10 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group["lr"] = lr
                 return lr
+        return None
 
     def construct_list_of_attributes(self):
         l = ["x", "y", "z", "nx", "ny", "nz"]
-        # All channels except the 3 DC.
         for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
             l.append("f_dc_{}".format(i))
         for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
@@ -202,22 +241,39 @@ class GaussianModel:
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_dc = (
+            self._features_dc.detach()
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        f_rest = (
+            self._features_rest.detach()
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, "f4") for attribute in self.construct_list_of_attributes()]
-
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate(
+            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
+        )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 
     def reset_opacity(self):
-        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01))
+        opacities_new = inverse_sigmoid(
+            torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
+        )
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -239,38 +295,58 @@ class GaussianModel:
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
-        extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
+        extra_f_names = [
+            p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")
+        ]
         extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
         assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P, F*SH_coeffs) to (P, F, SH_coeffs except DC).
-        features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
+        features_extra = features_extra.reshape(
+            (features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
+        )
 
-        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
+        scale_names = [
+            p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")
+        ]
         scale_names = sorted(scale_names, key=lambda x: int(x.split("_")[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
+        rot_names = [
+            p.name for p in plydata.elements[0].properties if p.name.startswith("rot")
+        ]
         rot_names = sorted(rot_names, key=lambda x: int(x.split("_")[-1]))
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._xyz = nn.Parameter(
+            torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
         self._features_dc = nn.Parameter(
-            torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True)
+            torch.tensor(features_dc, dtype=torch.float, device="cuda")
+            .transpose(1, 2)
+            .contiguous()
+            .requires_grad_(True)
         )
         self._features_rest = nn.Parameter(
-            torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True)
+            torch.tensor(features_extra, dtype=torch.float, device="cuda")
+            .transpose(1, 2)
+            .contiguous()
+            .requires_grad_(True)
         )
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-
+        self._opacity = nn.Parameter(
+            torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._scaling = nn.Parameter(
+            torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._rotation = nn.Parameter(
+            torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -295,11 +371,9 @@ class GaussianModel:
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
-
                 del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
                 self.optimizer.state[group["params"][0]] = stored_state
-
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
                 group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
@@ -332,21 +406,34 @@ class GaussianModel:
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
-
+                stored_state["exp_avg"] = torch.cat(
+                    (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
+                )
+                stored_state["exp_avg_sq"] = torch.cat(
+                    (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0
+                )
                 del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(
+                    torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True)
+                )
                 self.optimizer.state[group["params"][0]] = stored_state
-
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(
+                    torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True)
+                )
                 optimizable_tensors[group["name"]] = group["params"][0]
-
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(
+        self,
+        new_xyz,
+        new_features_dc,
+        new_features_rest,
+        new_opacities,
+        new_scaling,
+        new_rotation,
+    ):
         d = {
             "xyz": new_xyz,
             "f_dc": new_features_dc,
@@ -355,7 +442,6 @@ class GaussianModel:
             "scaling": new_scaling,
             "rotation": new_rotation,
         }
-
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -370,59 +456,138 @@ class GaussianModel:
         self.boundary_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, force_mask=None, child_scale_shrink=1.0):
-        n_init_points = self.get_xyz.shape[0]
+    def densify_and_split(
+        self,
+        grads,
+        grad_threshold,
+        scene_extent,
+        N=2,
+        force_mask=None,
+        child_scale_shrink=1.0,
+        base_grads=None,
+        child_min_opacity=0.0,
+    ):
+        """Split normal candidates and conservatively inject residual children.
 
-        # Extract points that satisfy the gradient condition.
+        Normal gradient-qualified candidates preserve the original 3DGS/Pixel-GS
+        behavior: the parent is replaced by N children.
+
+        Boundary-only candidates are weaker by definition. Their parent is kept,
+        while N low-opacity children are added. This avoids destroying a stable
+        photometric fit before the extra children have received any gradients.
+        """
+        n_init_points = self.get_xyz.shape[0]
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[: grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_by_gradient = padded_grad >= grad_threshold
 
-        # Used by boundary-guided propagation. It selects large Gaussians that may
-        # not reach the normal threshold because they are consistently truncated
-        # near image boundaries.
+        # Parent replacement must be decided from the unboosted Pixel-GS
+        # gradient. A boundary soft boost is only an invitation to add residual
+        # capacity; it must not silently become a destructive normal split.
+        if base_grads is None:
+            base_grads = grads
+        padded_base_grad = torch.zeros((n_init_points), device="cuda")
+        padded_base_grad[: base_grads.shape[0]] = base_grads.squeeze()
+
+        padded_force = torch.zeros((n_init_points), device="cuda", dtype=torch.bool)
         if force_mask is not None:
-            padded_force = torch.zeros((n_init_points), device="cuda", dtype=torch.bool)
             padded_force[: force_mask.shape[0]] = force_mask.bool()
-            selected_pts_mask = torch.logical_or(selected_pts_mask, padded_force)
 
-        selected_pts_mask = torch.logical_and(
-            selected_pts_mask,
-            torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent,
+        large_mask = (
+            torch.max(self.get_scaling, dim=1).values
+            > self.percent_dense * scene_extent
         )
+        normal_mask = (padded_base_grad >= grad_threshold) & large_mask
+        residual_mask = (selected_by_gradient | padded_force) & large_mask & (~normal_mask)
+        selected_pts_mask = normal_mask | residual_mask
 
         if selected_pts_mask.sum() == 0:
             return
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        selected_force_only = residual_mask[selected_pts_mask]
+        parent_scaling = self.get_scaling[selected_pts_mask]
+
+        stds = parent_scaling.repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(
-            self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N * child_scale_shrink)
+        new_xyz = (
+            torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
+            + self.get_xyz[selected_pts_mask].repeat(N, 1)
         )
+
+        # Do not alter normal split children. Apply the additional shrink only to
+        # boundary-only residual children.
+        per_parent_shrink = torch.ones(
+            (selected_pts_mask.sum(), 1),
+            device="cuda",
+            dtype=parent_scaling.dtype,
+        )
+        if selected_force_only.any():
+            per_parent_shrink[selected_force_only] = max(float(child_scale_shrink), 1.0)
+        new_scaling = self.scaling_inverse_activation(
+            parent_scaling.repeat(N, 1)
+            / (0.8 * N * per_parent_shrink.repeat(N, 1))
+        )
+
         new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        # For a force-only parent, keep the parent and allocate only a small
+        # opacity budget to all children together. At identical projection the N
+        # children jointly contribute approximately budget * parent_alpha.
+        if selected_force_only.any():
+            parent_alpha = self.get_opacity[selected_pts_mask]
+            total_child_alpha = (
+                parent_alpha * self.boundary_child_opacity_budget
+            ).clamp(min=1e-4, max=1.0 - 1e-4)
+            per_child_alpha = 1.0 - torch.pow(
+                1.0 - total_child_alpha,
+                1.0 / float(N),
+            )
+            per_child_alpha = per_child_alpha.clamp(
+                min=max(float(child_min_opacity), 1e-6),
+                max=1.0 - 1e-6,
+            )
+            per_child_raw = inverse_sigmoid(per_child_alpha)
+            repeated_force_only = selected_force_only.repeat(N)
+            repeated_child_raw = per_child_raw.repeat(N, 1)
+            new_opacity[repeated_force_only] = repeated_child_raw[repeated_force_only]
 
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+        )
+
+        # Only normal gradient-qualified parents are replaced. Boundary-only
+        # parents remain as a stable base representation until their children
+        # learn useful residual detail or are pruned.
         prune_filter = torch.cat(
             (
-                selected_pts_mask,
-                torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool),
+                normal_mask,
+                torch.zeros(
+                    N * selected_pts_mask.sum(),
+                    device="cuda",
+                    dtype=torch.bool,
+                ),
             )
         )
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
-        # Extract points that satisfy the gradient condition.
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.where(
+            torch.norm(grads, dim=-1) >= grad_threshold, True, False
+        )
         selected_pts_mask = torch.logical_and(
             selected_pts_mask,
-            torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent,
+            torch.max(self.get_scaling, dim=1).values
+            <= self.percent_dense * scene_extent,
         )
 
         new_xyz = self._xyz[selected_pts_mask]
@@ -432,7 +597,14 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+        )
 
     def densify_and_prune(
         self,
@@ -441,33 +613,74 @@ class GaussianModel:
         extent,
         max_screen_size,
         boundary_enabled=False,
-        boundary_grad_relax=0.35,
+        boundary_grad_relax=0.60,
         boundary_score_threshold=0.20,
-        boundary_boost_lambda=1.25,
-        boundary_boost_max=3.0,
-        boundary_split_shrink=1.0,
+        boundary_boost_lambda=1.00,
+        boundary_boost_max=2.00,
+        boundary_split_shrink=1.05,
+        boundary_min_view_count=None,
+        boundary_min_observations=None,
+        boundary_child_opacity_budget=None,
+        **_unused_boundary_kwargs,
     ):
+        # Compatibility with older/newer train.py variants. Some versions call
+        # this value ``boundary_min_view_count`` while the precision patch names
+        # it ``boundary_min_observations``. They are semantically identical.
+        effective_min_observations = self.boundary_min_observations
+        if boundary_min_observations is not None:
+            effective_min_observations = max(
+                1, int(boundary_min_observations)
+            )
+        elif boundary_min_view_count is not None:
+            effective_min_observations = max(
+                1, int(boundary_min_view_count)
+            )
+
+        if boundary_child_opacity_budget is not None:
+            self.boundary_child_opacity_budget = min(
+                max(float(boundary_child_opacity_budget), 0.0), 1.0
+            )
+
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         boundary_force_mask = None
-        if boundary_enabled and self.boundary_score_accum.numel() == self.xyz_gradient_accum.numel():
-            boundary_score = self.boundary_score_accum / torch.clamp_min(self.boundary_denom, 1.0)
+        if (
+            boundary_enabled
+            and self.boundary_score_accum.shape == self.xyz_gradient_accum.shape
+        ):
+            boundary_score = self.boundary_score_accum / torch.clamp_min(
+                self.boundary_denom, 1.0
+            )
             boundary_score[boundary_score.isnan()] = 0.0
             boundary_score = boundary_score.clamp(min=0.0, max=1.0)
 
+            # Require repeated, Gaussian-local high-error observations. A single
+            # border view can no longer trigger a destructive density change.
+            stable_boundary = (
+                self.boundary_denom >= float(effective_min_observations)
+            )
             grad_norm = torch.norm(grads, dim=-1, keepdim=True)
-            large_gaussian = (torch.max(self.get_scaling, dim=1).values > self.percent_dense * extent).unsqueeze(-1)
-            high_boundary = boundary_score >= boundary_score_threshold
-            relaxed_grad = grad_norm >= (max_grad * boundary_grad_relax)
-            boundary_force_mask = (high_boundary & relaxed_grad & large_gaussian).squeeze(-1)
+            large_gaussian = (
+                torch.max(self.get_scaling, dim=1).values
+                > self.percent_dense * extent
+            ).unsqueeze(-1)
+            high_boundary = (
+                boundary_score >= float(boundary_score_threshold)
+            ) & stable_boundary
+            relaxed_grad = grad_norm >= (max_grad * float(boundary_grad_relax))
+            boundary_force_mask = (
+                high_boundary & relaxed_grad & large_gaussian
+            ).squeeze(-1)
 
-            # A soft boost keeps normal Pixel-GS behavior but makes high-score
-            # boundary Gaussians easier to split. The hard force_mask above is
-            # only used for large Gaussians, so small foreground details are less
-            # likely to be duplicated by mistake.
-            boost = 1.0 + boundary_boost_lambda * boundary_score
-            boost = boost.clamp(min=1.0, max=boundary_boost_max)
+            # Soft enhancement is also limited to stable, large boundary points.
+            eligible_score = torch.where(
+                stable_boundary & large_gaussian,
+                boundary_score,
+                torch.zeros_like(boundary_score),
+            )
+            boost = 1.0 + float(boundary_boost_lambda) * eligible_score
+            boost = boost.clamp(min=1.0, max=float(boundary_boost_max))
             grads_for_densify = grads * boost
         else:
             grads_for_densify = grads
@@ -479,30 +692,33 @@ class GaussianModel:
             extent,
             force_mask=boundary_force_mask,
             child_scale_shrink=boundary_split_shrink,
+            base_grads=grads,
+            child_min_opacity=min_opacity * 1.2,
         )
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            prune_mask = torch.logical_or(
+                torch.logical_or(prune_mask, big_points_vs), big_points_ws
+            )
         self.prune_points(prune_mask)
-
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, pixels):
         self.xyz_gradient_accum[update_filter] += (
-            torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True) * pixels[update_filter]
+            torch.norm(
+                viewspace_point_tensor.grad[update_filter, :2],
+                dim=-1,
+                keepdim=True,
+            )
+            * pixels[update_filter]
         )
         self.denom[update_filter] += pixels[update_filter]
 
     def _project_points_to_screen(self, viewpoint_camera):
-        """Project Gaussian centers to image coordinates in Python.
-
-        This avoids modifying the CUDA rasterizer. The matrix convention follows
-        the original 3DGS/Pixel-GS Python code: homogeneous row vectors multiply
-        the full projection transform.
-        """
+        """Project Gaussian centers to image coordinates in Python."""
         xyz = self.get_xyz.detach()
         device = xyz.device
         ones = torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=device)
@@ -536,24 +752,22 @@ class GaussianModel:
         scene_extent,
         opt,
     ):
-        """Accumulate boundary-truncation statistics for progressive densification.
+        """Accumulate locally validated boundary-truncation statistics.
 
-        A Gaussian receives a boundary score only when:
-          1) it is visible in the current view;
-          2) it is large in world scale, so split is meaningful;
-          3) its projected support is truncated by the image boundary;
-          4) the current image boundary band has higher error than the image mean.
-
-        This approximates the proposed "inner-to-outer" propagation: once a
-        boundary-truncated parent is split, its children can collect statistics in
-        later iterations and become the next propagation seeds.
+        The image-level boundary ratio is only a cheap first-stage filter. The
+        final decision is Gaussian-local: each projected center samples a smoothed
+        residual map, and only repeatedly high-error, truncated, large Gaussians
+        accumulate a score.
         """
         if self.get_xyz.shape[0] == 0:
             return
-
         if self.boundary_score_accum.shape[0] != self.get_xyz.shape[0]:
-            self.boundary_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-            self.boundary_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+            self.boundary_score_accum = torch.zeros(
+                (self.get_xyz.shape[0], 1), device="cuda"
+            )
+            self.boundary_denom = torch.zeros(
+                (self.get_xyz.shape[0], 1), device="cuda"
+            )
 
         with torch.no_grad():
             H = int(viewpoint_cam.image_height)
@@ -561,13 +775,18 @@ class GaussianModel:
             if H <= 0 or W <= 0:
                 return
 
-            band = max(4.0, min(float(H), float(W)) * float(opt.boundary_band_ratio))
+            band = max(
+                4.0,
+                min(float(H), float(W)) * float(opt.boundary_band_ratio),
+            )
 
-            # Boundary error gate. If the image boundary is already well
-            # reconstructed, do not add extra Gaussians there.
-            residual = torch.mean(torch.abs(rendered_image - gt_image), dim=0)  # H x W
-            yy = torch.arange(H, device=residual.device, dtype=residual.dtype).view(H, 1)
-            xx = torch.arange(W, device=residual.device, dtype=residual.dtype).view(1, W)
+            residual = torch.mean(torch.abs(rendered_image - gt_image), dim=0)
+            yy = torch.arange(
+                H, device=residual.device, dtype=residual.dtype
+            ).view(H, 1)
+            xx = torch.arange(
+                W, device=residual.device, dtype=residual.dtype
+            ).view(1, W)
             dist_img = torch.minimum(
                 torch.minimum(xx, float(W - 1) - xx),
                 torch.minimum(yy, float(H - 1) - yy),
@@ -582,7 +801,22 @@ class GaussianModel:
             if error_ratio < float(opt.boundary_error_threshold):
                 return
 
-            # Project centers and estimate image-boundary truncation.
+            # Smooth the residual before point sampling so a one-pixel mismatch
+            # does not create an unstable split decision.
+            local_window = max(3, int(getattr(opt, "boundary_local_window", 9)))
+            if local_window % 2 == 0:
+                local_window += 1
+            max_kernel = min(H, W)
+            if max_kernel % 2 == 0:
+                max_kernel -= 1
+            local_window = min(local_window, max(1, max_kernel))
+            local_residual_map = F.avg_pool2d(
+                residual[None, None],
+                kernel_size=local_window,
+                stride=1,
+                padding=local_window // 2,
+            )[0, 0]
+
             x, y, depth = self._project_points_to_screen(viewpoint_cam)
             r = radii.detach().float()
             px = pixels.detach().view(-1, 1).float()
@@ -591,29 +825,80 @@ class GaussianModel:
                 torch.minimum(x, float(W - 1) - x),
                 torch.minimum(y, float(H - 1) - y),
             )
-            truncation = torch.clamp((r - dist_to_border) / torch.clamp_min(r, 1e-6), 0.0, 1.0)
-            boundary_band_weight = torch.clamp((band - dist_to_border) / band, 0.0, 1.0)
+            truncation = torch.clamp(
+                (r - dist_to_border) / torch.clamp_min(r, 1e-6),
+                0.0,
+                1.0,
+            )
+            boundary_band_weight = torch.clamp(
+                (band - dist_to_border) / band,
+                0.0,
+                1.0,
+            )
 
-            # Keep the original Pixel-GS depth idea: avoid encouraging near-camera
-            # floaters. If depth is invalid or near zero, this term suppresses it.
-            depth_threshold = torch.tensor(float(opt.depth_threshold) * float(scene_extent), device=depth.device, dtype=depth.dtype)
-            depth_scale = torch.clamp((depth / torch.clamp_min(depth_threshold, 1e-6)) ** 2, 0.0, 1.0)
+            depth_threshold = torch.tensor(
+                float(opt.depth_threshold) * float(scene_extent),
+                device=depth.device,
+                dtype=depth.dtype,
+            )
+            depth_scale = torch.clamp(
+                (depth / torch.clamp_min(depth_threshold, 1e-6)) ** 2,
+                0.0,
+                1.0,
+            )
 
-            large_gaussian = torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
+            large_gaussian = (
+                torch.max(self.get_scaling, dim=1).values
+                > self.percent_dense * scene_extent
+            )
             visible = visibility_filter.bool() & (r > 0)
-            valid = visible & large_gaussian & (truncation >= float(opt.boundary_min_truncation))
+
+            # For centers outside the image but with a support intersecting it,
+            # clamp to the nearest border pixel. This samples the residual of the
+            # actually visible part rather than discarding the Gaussian.
+            xi = x.round().long().clamp(0, W - 1)
+            yi = y.round().long().clamp(0, H - 1)
+            local_error = local_residual_map[yi, xi]
+            local_error_ratio = local_error / torch.clamp_min(global_err, 1e-6)
+
+            local_threshold = float(
+                getattr(opt, "boundary_local_error_threshold", 1.10)
+            )
+            local_cap = max(
+                float(getattr(opt, "boundary_local_error_cap", 1.80)),
+                local_threshold + 1e-6,
+            )
+            local_valid = local_error_ratio >= local_threshold
+
+            valid = (
+                visible
+                & large_gaussian
+                & (truncation >= float(opt.boundary_min_truncation))
+                & local_valid
+            )
             if valid.sum() == 0:
                 return
 
-            # Score is in [0, 1] and combines boundary position, truncation,
-            # image error and Pixel-GS pixel coverage. Using sqrt(px) avoids
-            # killing the very case we want to fix: consistently low visible area.
             px_weight = torch.sqrt(torch.clamp(px.squeeze(-1), min=0.0))
-            px_weight = px_weight / torch.clamp_min(px_weight[visible].mean(), 1e-6)
-            px_weight = px_weight.clamp(0.25, 2.0)
+            visible_px_mean = torch.clamp_min(px_weight[visible].mean(), 1e-6)
+            px_weight = (px_weight / visible_px_mean).clamp(0.25, 2.0)
 
-            score = truncation * boundary_band_weight * depth_scale * px_weight
-            score = score.clamp(0.0, 1.0)
+            # Threshold-level local residual keeps half weight; increasingly hard
+            # local regions approach full weight. This preserves useful LPIPS-
+            # oriented detail growth without letting a noisy pixel dominate.
+            local_progress = (
+                (local_error_ratio - local_threshold)
+                / (local_cap - local_threshold)
+            ).clamp(0.0, 1.0)
+            local_weight = 0.5 + 0.5 * local_progress
+
+            score = (
+                truncation
+                * boundary_band_weight
+                * depth_scale
+                * px_weight
+                * local_weight
+            ).clamp(0.0, 1.0)
 
             self.boundary_score_accum[valid] += score[valid].unsqueeze(-1)
             self.boundary_denom[valid] += 1.0

@@ -30,6 +30,17 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+def _boundary_enabled_this_iter(opt, iteration):
+    if not opt.enable_boundary_propagation:
+        return False
+    if iteration < opt.boundary_start_iter:
+        return False
+    # boundary_stop_iter <= 0 means no explicit stop.
+    if getattr(opt, "boundary_stop_iter", 0) > 0 and iteration > opt.boundary_stop_iter:
+        return False
+    return True
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -108,7 +119,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss.
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        ssim_loss = 1.0 - ssim(image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
+
+        # Late MSE fine-tune: helps PSNR recover after structure-changing
+        # boundary densification has stopped.
+        mse_loss = None
+        if getattr(opt, "lambda_mse", 0.0) > 0.0 and iteration >= getattr(opt, "mse_start_iter", opt.iterations + 1):
+            mse_loss = torch.mean((image - gt_image) ** 2)
+            loss = loss + opt.lambda_mse * mse_loss
+
         loss.backward()
 
         iter_end.record()
@@ -134,7 +154,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene,
                 render,
                 (pipe, background),
+                mse_loss=mse_loss,
             )
+
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -152,13 +174,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     render_pkg["pixels"],
                 )
 
-                # Optional boundary-guided progressive densification.
-                # Motivation: Pixel-GS relies on pixel-weighted gradients. If a
-                # large Gaussian is truncated by image boundaries in almost all
-                # views, the central high-response pixels may never be observed.
-                # This branch adds a Python-side boundary/high-error gate and
-                # relaxes split for those Gaussians. No CUDA kernel is changed.
-                if opt.enable_boundary_propagation and iteration >= opt.boundary_start_iter:
+                boundary_now = _boundary_enabled_this_iter(opt, iteration)
+                if boundary_now:
                     gaussians.add_boundary_densification_stats(
                         viewpoint_cam=viewpoint_cam,
                         radii=radii,
@@ -177,12 +194,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         0.005,
                         scene.cameras_extent,
                         size_threshold,
-                        boundary_enabled=opt.enable_boundary_propagation,
+                        boundary_enabled=boundary_now,
                         boundary_grad_relax=opt.boundary_grad_relax,
                         boundary_score_threshold=opt.boundary_score_threshold,
                         boundary_boost_lambda=opt.boundary_boost_lambda,
                         boundary_boost_max=opt.boundary_boost_max,
                         boundary_split_shrink=opt.boundary_split_shrink,
+                        boundary_min_view_count=opt.boundary_min_view_count,
+                        boundary_force_opacity_scale=opt.boundary_force_opacity_scale,
                     )
 
                 if iteration % opt.opacity_reset_interval == 0 or (
@@ -223,10 +242,24 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc, renderArgs):
+def training_report(
+    tb_writer,
+    iteration,
+    Ll1,
+    loss,
+    l1_loss,
+    elapsed,
+    testing_iterations,
+    scene: Scene,
+    renderFunc,
+    renderArgs,
+    mse_loss=None,
+):
     if tb_writer:
         tb_writer.add_scalar("train_loss_patches/l1_loss", Ll1.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/total_loss", loss.item(), iteration)
+        if mse_loss is not None:
+            tb_writer.add_scalar("train_loss_patches/mse_loss", mse_loss.item(), iteration)
         tb_writer.add_scalar("iter_time", elapsed, iteration)
 
     # Report test and samples of training set.
@@ -248,7 +281,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
-                        tb_writer.add_images(config["name"] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        tb_writer.add_images(
+                            config["name"] + "_view_{}/render".format(viewpoint.image_name),
+                            image[None],
+                            global_step=iteration,
+                        )
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(
                                 config["name"] + "_view_{}/ground_truth".format(viewpoint.image_name),
